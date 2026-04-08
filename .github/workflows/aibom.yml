@@ -1,0 +1,126 @@
+# GitHub Action — CI/CD AIBOM Generation
+# File: .github/workflows/aibom.yml
+# Drop this into any repo that uses AI agents to get AIBOM on every push.
+
+name: Generate AI Bill of Materials (AIBOM)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Run weekly on Mondays at 09:00 UTC for drift detection
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    # Allow manual trigger
+
+jobs:
+  aibom:
+    name: Scan and generate AIBOM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write  # For uploading to GitHub Security tab
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for change detection
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install AgentDiscover Scanner
+        run: |
+          pip install agent-discover-scanner
+
+      - name: Run AIBOM scan
+        id: aibom_scan
+        run: |
+          agent-discover audit \
+            --output ./aibom-output/ \
+            --format cyclonedx-1.6 \
+            --no-runtime \
+            --ci
+        env:
+          # Optional: if your agents use these, the scanner can validate configs
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Upload AIBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aibom-${{ github.sha }}
+          path: ./aibom-output/
+          retention-days: 90
+
+      - name: Check for GHOST agent findings
+        run: |
+          if [ -f ./aibom-output/ghost-agents.md ]; then
+            GHOST_COUNT=$(grep -c "CRITICAL\|HIGH" ./aibom-output/ghost-agents.md || true)
+            if [ "$GHOST_COUNT" -gt "0" ]; then
+              echo "::warning::GHOST agent findings detected. Review aibom-output/ghost-agents.md"
+            fi
+          fi
+
+      - name: Check for Toxic Flow findings
+        run: |
+          if [ -f ./aibom-output/toxic-flows.md ]; then
+            echo "::warning::Potential Toxic Flow patterns detected. Review aibom-output/toxic-flows.md"
+          fi
+
+      - name: Comment PR with AIBOM summary
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let summary = '## AgentDiscover AIBOM Summary\n\n';
+
+            try {
+              const aibom = JSON.parse(fs.readFileSync('./aibom-output/aibom.json', 'utf8'));
+              const components = aibom.components || [];
+              const agentCount = components.filter(c => c.type === 'ai-model').length;
+              const ghostCount = components.filter(c => {
+                const ghost = c.properties?.find(p => p.name === 'agent:ghost');
+                return ghost?.value === 'true';
+              }).length;
+
+              summary += `| Metric | Value |\n|---|---|\n`;
+              summary += `| Agents inventoried | ${agentCount} |\n`;
+              summary += `| GHOST agents | ${ghostCount === 0 ? '✅ 0' : '🚨 ' + ghostCount} |\n`;
+              summary += `| AIBOM format | CycloneDX 1.6 |\n`;
+              summary += `| Scan commit | \`${context.sha.substring(0, 7)}\` |\n\n`;
+
+              if (ghostCount > 0) {
+                summary += '> ⚠️ **GHOST agents detected** — agents visible at runtime with no declared inventory entry. Review `aibom-output/ghost-agents.md`.\n';
+              } else {
+                summary += '> ✅ All detected agents match declared inventory.\n';
+              }
+            } catch (e) {
+              summary += '_AIBOM generation completed. Download artifact for full report._\n';
+            }
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+
+      - name: Fail on critical GHOST findings
+        if: ${{ inputs.fail_on_ghost || false }}
+        run: |
+          if [ -f ./aibom-output/ghost-agents.md ]; then
+            CRITICAL=$(grep -c "CRITICAL" ./aibom-output/ghost-agents.md || true)
+            if [ "$CRITICAL" -gt "0" ]; then
+              echo "Critical GHOST agent found. Failing build."
+              exit 1
+            fi
+          fi
