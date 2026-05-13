@@ -45,6 +45,10 @@ BUILTIN_KNOWN_APPS = frozenset({
     "lmstudio", "lm studio",
     "jan",
     "msty",
+    # Windows process name variants — psutil returns names without .exe on Windows
+    # after windows_detector normalises them, but network_monitor may not
+    "cursor.exe", "claude.exe", "chatgpt.exe", "windsurf.exe",
+    "ollama.exe", "lmstudio.exe", "copilot.exe", "codeium.exe",
     # Apple apps
     "notes", "apple notes",
     "mail", "apple mail",

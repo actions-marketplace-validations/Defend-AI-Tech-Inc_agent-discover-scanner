@@ -608,6 +608,11 @@ def scan_all(
         "--src-repo-ttl",
         help="In daemon mode: minimum seconds between re-scans of --src-repo (default: 3600)",
     ),
+    summary: bool = typer.Option(
+        False,
+        "--summary",
+        help="Print a concise executive summary after the scan (agent counts, highest risk, top SaaS connections, single recommendation)",
+    ),
 ):
     """
     Run a full 4-layer AI agent scan, correlate all findings,
@@ -645,6 +650,7 @@ def scan_all(
         dry_run=dry_run,
         src_repo=src_repo,
         src_repo_ttl=src_repo_ttl,
+        summary=summary,
     )
 
 

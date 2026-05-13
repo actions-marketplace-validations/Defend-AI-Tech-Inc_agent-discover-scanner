@@ -181,6 +181,104 @@ def _run_dry_run(path: str, skip_layers: Optional[str], duration: int, daemon: b
     raise typer.Exit(code=0)
 
 
+def _print_executive_summary(report: dict, output_dir: Path, scan_path: str) -> None:
+    """Print a non-technical CISO-readable summary after a completed scan."""
+    from datetime import date as _date
+
+    summary = report.get("summary", {})
+    risk = report.get("risk_breakdown", {})
+    inventory = report.get("inventory", {})
+
+    ghost_count = summary.get("ghost", 0)
+    confirmed_count = summary.get("confirmed", 0)
+    unknown_count = summary.get("unknown", 0)
+    shadow_count = summary.get("shadow_ai_usage", 0)
+    critical_count = risk.get("critical", 0)
+
+    # Collect SaaS connections across all agents, highest-confidence first
+    saas_confirmed: list[str] = []
+    saas_detected: list[str] = []
+    ghost_agents = inventory.get("ghost", [])
+    for cat_agents in inventory.values():
+        if not isinstance(cat_agents, list):
+            continue
+        for agent in cat_agents:
+            saas = agent.get("saas_connections", {}) or {}
+            for p in saas.get("confirmed", []):
+                if p not in saas_confirmed:
+                    saas_confirmed.append(p)
+            for p in saas.get("detected", []):
+                if p not in saas_confirmed and p not in saas_detected:
+                    saas_detected.append(p)
+
+    divider = "─" * 60
+    console.print(f"\n[bold]{divider}[/bold]")
+    console.print("  [bold cyan]AI Agent Security Scan — Executive Summary[/bold cyan]")
+    console.print(f"[bold]{divider}[/bold]")
+    console.print(f"  [dim]Target:[/dim] {scan_path}   [dim]Date:[/dim] {_date.today()}")
+    console.print()
+
+    # Agent counts
+    console.print("  [bold]AGENTS FOUND[/bold]")
+    if ghost_count:
+        console.print(f"    [red]{ghost_count:>2}  Ghost[/red]      — Active AI with no source code, owner, or record")
+    if confirmed_count:
+        console.print(f"    [yellow]{confirmed_count:>2}  Confirmed[/yellow]  — Seen in code and observed making API calls")
+    if unknown_count:
+        console.print(f"    [blue]{unknown_count:>2}  In code[/blue]    — Found in source, not yet observed running")
+    if shadow_count:
+        console.print(f"    [dim]{shadow_count:>2}  Shadow AI[/dim]  — Known AI tools needing governance review")
+    if not (ghost_count or confirmed_count or unknown_count or shadow_count):
+        console.print("    [dim] 0  No AI agents detected[/dim]")
+    console.print()
+
+    # Highest risk finding — one sentence
+    console.print("  [bold]HIGHEST RISK[/bold]")
+    if ghost_count:
+        detail = ""
+        if ghost_agents:
+            saas = (ghost_agents[0].get("saas_connections") or {}).get("confirmed", [])
+            if saas:
+                detail = f" connected to {saas[0]}"
+        console.print(f"    [red]⚠  {ghost_count} ungoverned agent{'s' if ghost_count > 1 else ''}{detail} — no owner, no code, no approval.[/red]")
+    elif critical_count:
+        console.print(f"    [yellow]⚠  {critical_count} critical finding{'s' if critical_count > 1 else ''} require immediate review.[/yellow]")
+    elif confirmed_count:
+        console.print(f"    [dim]   {confirmed_count} confirmed agent{'s' if confirmed_count > 1 else ''} — governed and active.[/dim]")
+    else:
+        console.print("    [green]   No critical findings detected.[/green]")
+    console.print()
+
+    # SaaS blast radius — top 4 only
+    all_saas = [(p, "confirmed active connection") for p in saas_confirmed] + \
+               [(p, "detected") for p in saas_detected]
+    if all_saas:
+        console.print("  [bold]EXTERNAL SERVICES REACHED[/bold]")
+        for provider, confidence in all_saas[:4]:
+            console.print(f"    [dim]{provider:<22}[/dim] {confidence}")
+        if len(all_saas) > 4:
+            console.print(f"    [dim]+ {len(all_saas) - 4} more[/dim]")
+        console.print()
+
+    # Single recommendation
+    console.print("  [bold]RECOMMENDATION[/bold]")
+    if ghost_count:
+        console.print("    [red]Stop[/red] the ghost agent immediately. Identify its owner and rotate")
+        console.print("    any API keys it may have used before re-authorizing.")
+    elif critical_count:
+        console.print(f"    Review {critical_count} critical finding{'s' if critical_count > 1 else ''} before the next production deployment.")
+    elif unknown_count:
+        console.print(f"    Confirm {unknown_count} in-code agent{'s have' if unknown_count > 1 else ' has'} an approved owner and security review.")
+    elif shadow_count:
+        console.print(f"    Add {shadow_count} Shadow AI tool{'s' if shadow_count > 1 else ''} to your AI governance register.")
+    else:
+        console.print("    No immediate action required. Schedule a periodic re-scan.")
+    console.print()
+
+    console.print(f"  [dim]Full report: {output_dir / 'agent_inventory.json'}[/dim]")
+    console.print(f"[bold]{divider}[/bold]\n")
+
+
 def execute_scan_all(
     *,
     path: str,
@@ -202,6 +300,7 @@ def execute_scan_all(
     dry_run: bool = False,
     src_repo: Optional[str] = None,
     src_repo_ttl: int = 3600,
+    summary: bool = False,
 ) -> Optional[dict]:
     """Run full or partial scan-all. Returns report dict, or None if MCP-only early exit."""
     if dry_run:
@@ -394,21 +493,22 @@ def execute_scan_all(
             return
         console.print("[bold green]🌐 Monitoring live network connections...[/bold green]")
         try:
-            # macOS: instant zero-privilege app + process presence check
-            macos_presence: list[dict] = []
-            if sys.platform == "darwin":
-                try:
+            # Platform-native: instant zero-privilege app + process presence check
+            native_presence: list[dict] = []
+            try:
+                if sys.platform == "darwin":
                     from agent_discover_scanner.macos_detector import scan_ai_presence
-                    macos_presence = scan_ai_presence()
-                    if macos_presence:
-                        console.print("[dim]  AI tools detected on this machine:[/dim]")
-                        for f in macos_presence:
-                            status = "running" if f.get("source") == "running_process" else "installed"
-                            console.print(
-                                f"  [cyan]✓[/cyan] {f['display_name']} ({status})"
-                            )
-                except Exception:
-                    pass
+                    native_presence = scan_ai_presence()
+                elif sys.platform == "win32":
+                    from agent_discover_scanner.windows_detector import scan_ai_presence
+                    native_presence = scan_ai_presence()
+                if native_presence:
+                    console.print("[dim]  AI tools detected on this machine:[/dim]")
+                    for f in native_presence:
+                        status = "running" if f.get("source") == "running_process" else "installed"
+                        console.print(f"  [cyan]✓[/cyan] {f['display_name']} ({status})")
+            except Exception:
+                pass
 
             net_monitor = NetworkMonitor()
             summary = net_monitor.monitor(duration_seconds=duration)
@@ -437,9 +537,9 @@ def execute_scan_all(
                     }
                 )
 
-            # Merge macOS presence findings — skip any provider already seen via live connection
+            # Merge native presence findings — skip providers already seen via live connection
             live_providers = {f.get("provider") for f in nf}
-            for mf in macos_presence:
+            for mf in native_presence:
                 if mf.get("provider") not in live_providers:
                     nf.append({
                         "provider": mf["provider"],
@@ -1245,6 +1345,9 @@ def execute_scan_all(
             console.print("[dim]  • On macOS, install Claude Desktop or Cursor to see Shadow AI detection[/dim]")
         console.print("[dim]  • Try git-scan to find AI dependencies introduced in git history:[/dim]")
         console.print(f"[dim]    agent-discover git-scan {path}[/dim]\n")
+
+    if summary and not daemon:
+        _print_executive_summary(report, output_dir, path)
 
     if scan_output_format == "json":
         console.print(json.dumps(report, indent=2))
