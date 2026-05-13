@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-05-12
+
+### Added
+
+- **`git-scan` subcommand** — scan git commit history for AI-related security signals without running a full multi-layer scan
+  - Detects AI API keys committed to history (OpenAI, Anthropic, Google, Cohere, Groq) — rule `DAI-GIT-001`, severity critical
+  - Finds sensitive files ever tracked in git (`.env`, model weight files, AI config files) — rule `DAI-GIT-002`, severity high
+  - Reports when each AI framework was first introduced to dependency files (requirements.txt, package.json, pyproject.toml) — rule `DAI-GIT-005`, severity info
+  - Exits with code 1 on critical or high findings for CI/CD gate use
+  - `--since DAYS` controls secret search window (default: 90 days); sensitive file and dependency scans always cover full history
+  - `--output FILE` writes findings as JSON
+  - `--verbose` shows dependency introduction timeline (hidden by default)
+
+- **`--src-repo` / `--src-repo-ttl` flags for `scan-all`** — scan a second source repository through Layer 1 and merge findings into `layer1_code.sarif`
+  - Supports local paths (no clone) and remote URLs (shallow `git clone --depth=1`)
+  - Useful when the runtime being monitored is served by a repo separate from the scan root (microservices, shared ML libraries)
+  - In daemon mode, `--src-repo-ttl SECONDS` gates how often the repo is re-fetched (default: 3600)
+  - Auth failures (HTTP 401/403, SSH rejection) back off exponentially (30s → 300s) without interrupting the primary scan
+
+- **macOS AI presence detection** (`macos_detector.py`) — zero-privilege check runs at the start of Layer 2 on macOS
+  - Checks `/Applications/` and `~/Applications/` for known AI app bundles
+  - Scans running processes via psutil for AI tool process names
+  - Prints detected tools (Claude Desktop, Cursor, Ollama, etc.) immediately — before the network observation window begins
+  - Findings are injected into Layer 2 output and flow into the correlator as Shadow AI (live connections take priority; presence findings fill gaps)
+
+- **Network monitor progress ticks** — prints `[Ns] Watching for AI connections... (Ns remaining)` every 15 seconds when no detection has fired, eliminating the silent wait during the observation window
+
+- **Zero-findings guidance** — when all inventory counts are zero after a one-shot scan, prints actionable next steps pointing at likely causes and suggesting `git-scan` as an alternative
+
+### Changed
+
+- **Known apps list expanded** — added Windsurf, Windsurf Helper, Zed, Gemini, Perplexity, GitHub Copilot, Codeium, Ollama, Ollama Runner, LM Studio, Jan, Msty to `BUILTIN_KNOWN_APPS`; these now classify as Shadow AI rather than producing false GHOST findings
+
+### Fixed
+
+- macOS scans no longer produce GHOST false positives for Windsurf, Zed, Ollama, LM Studio, and Perplexity when those tools are running and making network connections
+
 ## [2.5.0] - 2026-04-06
 
 ### Added
