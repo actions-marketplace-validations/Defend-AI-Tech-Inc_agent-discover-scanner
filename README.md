@@ -498,9 +498,54 @@ Agent Inventory Report — acme-corp
 
 ## CI/CD integration
 
+### GitHub Action (recommended)
+
+The repo ships a reusable composite action. Add it to any workflow with one step — no `pip install` required:
+
 ```yaml
 # .github/workflows/agent-scan.yml
-- name: Scan for AI agents (Layer 1 — source code)
+name: AI Agent Scan
+
+on: [push, pull_request]
+
+permissions:
+  security-events: write   # required to upload SARIF to GitHub Security tab
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Defend-AI-Tech-Inc/agent-discover-scanner@v2.6.0
+        with:
+          path: '.'               # directory to scan (default: .)
+          upload-sarif: 'true'    # post findings to GitHub Security tab (default: true)
+```
+
+Findings appear in **Security → Code scanning alerts** as soon as the workflow runs.
+
+**Inputs**
+
+| Input | Default | Description |
+|---|---|---|
+| `path` | `.` | Directory to scan |
+| `output` | `agent-scan-results.sarif` | SARIF output file path |
+| `upload-sarif` | `true` | Upload to GitHub Security tab |
+| `python-version` | `3.12` | Python version to use |
+
+**Output**
+
+| Output | Description |
+|---|---|
+| `sarif-file` | Path to the generated SARIF file |
+
+> **Note:** `permissions: security-events: write` is required at the job or workflow level for `upload-sarif: 'true'` to work. If your repo is private and you don't have GitHub Advanced Security, set `upload-sarif: 'false'` and consume the SARIF artifact directly.
+
+### Manual install in CI
+
+```yaml
+- name: Scan for AI agents
   run: |
     pip install agent-discover-scanner
     agent-discover-scanner scan . --format sarif --output results.sarif
@@ -511,7 +556,7 @@ Agent Inventory Report — acme-corp
     sarif_file: results.sarif
 ```
 
-For a full-stack scan in CI (all layers, structured output):
+For a full-stack scan (all layers, structured output):
 
 ```yaml
 - name: Full agent scan
@@ -519,8 +564,7 @@ For a full-stack scan in CI (all layers, structured output):
     agent-discover-scanner scan-all . \
       --duration 30 \
       --output ./defendai-results \
-      --skip-layers 3    # skip K8s layer in CI — no cluster available
-      # Note: Layer 3 (eBPF/Tetragon) is Linux-only. Layer 2 requires elevated privileges on Linux.
+      --skip-layers 3    # no K8s cluster in CI
 ```
 
 ---
