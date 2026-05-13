@@ -30,10 +30,21 @@ BUILTIN_KNOWN_APPS = frozenset({
     "powerpoint", "microsoft powerpoint",
     "teams", "microsoft teams",
     "onedrive", "microsoft onedrive",
-    # AI desktop apps
+    # AI desktop apps (cloud)
     "cursor", "cursor helper",
     "claude", "claude helper", "claude desktop",
     "chatgpt",
+    "windsurf", "windsurf helper",
+    "zed",
+    "gemini",
+    "perplexity",
+    "copilot", "github copilot",
+    "codeium",
+    # Local LLM runtimes — no outbound cloud calls but still AI infrastructure
+    "ollama", "ollama runner",
+    "lmstudio", "lm studio",
+    "jan",
+    "msty",
     # Apple apps
     "notes", "apple notes",
     "mail", "apple mail",

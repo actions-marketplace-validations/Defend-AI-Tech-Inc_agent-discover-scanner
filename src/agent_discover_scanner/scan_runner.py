@@ -8,6 +8,8 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -74,6 +76,51 @@ def _invoke_layer1_scan(scan_root: str, layer1_sarif: str) -> None:
 
 def _check_dependency(cmd: str) -> bool:
     return shutil.which(cmd) is not None
+
+
+def _is_remote_url(src_repo: str) -> bool:
+    return src_repo.startswith(("https://", "http://", "git@", "git://", "ssh://"))
+
+
+def _src_repo_id(src_repo: str) -> str:
+    """Stable short identifier for a source repo, used in log messages."""
+    if _is_remote_url(src_repo):
+        return hashlib.sha256(src_repo.encode()).hexdigest()[:12]
+    path = Path(src_repo).resolve()
+    try:
+        r = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, cwd=path, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return hashlib.sha256(r.stdout.strip().encode()).hexdigest()[:12]
+    except Exception:
+        pass
+    return hashlib.sha256(f"{socket.gethostname()}:{path}".encode()).hexdigest()[:12]
+
+
+def _merge_sarif_results(primary: Path, additional: Path) -> None:
+    """Append SARIF results from additional into primary, writing primary in place."""
+    try:
+        if not additional.exists() or additional.stat().st_size == 0:
+            return
+        extra = json.loads(additional.read_text(encoding="utf-8"))
+        extra_results: list = []
+        for run in extra.get("runs", []):
+            extra_results.extend(run.get("results", []))
+        if not extra_results:
+            return
+        if primary.exists() and primary.stat().st_size > 0:
+            primary_data = json.loads(primary.read_text(encoding="utf-8"))
+            if primary_data.get("runs"):
+                primary_data["runs"][0].setdefault("results", []).extend(extra_results)
+            else:
+                primary_data = extra
+        else:
+            primary_data = extra
+        primary.write_text(json.dumps(primary_data, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning("src-repo: SARIF merge failed: %s", e)
 
 
 def _run_dry_run(path: str, skip_layers: Optional[str], duration: int, daemon: bool) -> None:
@@ -153,6 +200,8 @@ def execute_scan_all(
     scan_output_format: str,
     layer: Optional[str] = None,
     dry_run: bool = False,
+    src_repo: Optional[str] = None,
+    src_repo_ttl: int = 3600,
 ) -> Optional[dict]:
     """Run full or partial scan-all. Returns report dict, or None if MCP-only early exit."""
     if dry_run:
@@ -345,6 +394,22 @@ def execute_scan_all(
             return
         console.print("[bold green]🌐 Monitoring live network connections...[/bold green]")
         try:
+            # macOS: instant zero-privilege app + process presence check
+            macos_presence: list[dict] = []
+            if sys.platform == "darwin":
+                try:
+                    from agent_discover_scanner.macos_detector import scan_ai_presence
+                    macos_presence = scan_ai_presence()
+                    if macos_presence:
+                        console.print("[dim]  AI tools detected on this machine:[/dim]")
+                        for f in macos_presence:
+                            status = "running" if f.get("source") == "running_process" else "installed"
+                            console.print(
+                                f"  [cyan]✓[/cyan] {f['display_name']} ({status})"
+                            )
+                except Exception:
+                    pass
+
             net_monitor = NetworkMonitor()
             summary = net_monitor.monitor(duration_seconds=duration)
             providers = getattr(CorrelationEngine, "_PROVIDERS", set())
@@ -358,7 +423,6 @@ def execute_scan_all(
                 except Exception:
                     provider = None
                 if not provider:
-                    # fallback to prior substring match for any remaining providers
                     for slug in providers:
                         if slug in service or slug in host:
                             provider = slug
@@ -372,6 +436,17 @@ def execute_scan_all(
                         "timestamp": conn.get("timestamp"),
                     }
                 )
+
+            # Merge macOS presence findings — skip any provider already seen via live connection
+            live_providers = {f.get("provider") for f in nf}
+            for mf in macos_presence:
+                if mf.get("provider") not in live_providers:
+                    nf.append({
+                        "provider": mf["provider"],
+                        "process_name": mf["process_name"],
+                        "timestamp": mf["timestamp"],
+                    })
+
             summary_with_findings = {**summary, "findings": nf}
             _rotate_file_if_needed(layer2_json, max_log_size_bytes, max_log_backups)
             layer2_json.write_text(json.dumps(summary_with_findings, indent=2))
@@ -502,6 +577,80 @@ def execute_scan_all(
         except Exception as e:
             console.print(f"[red]Layer 4 endpoint scan failed:[/red] {e}")
 
+    def run_src_repo_once() -> str:
+        """Clone (remote) or reuse (local) src_repo, run Layer 1, merge SARIF. Returns outcome."""
+        if not src_repo or is_skipped(1):
+            return "skipped"
+        tmp_dir: Optional[str] = None
+        tmp_sarif_path: Optional[Path] = None
+        repo_id = _src_repo_id(src_repo)
+        try:
+            if _is_remote_url(src_repo):
+                tmp_dir = tempfile.mkdtemp(prefix="agentdiscover_src_")
+                result = subprocess.run(
+                    ["git", "clone", "--depth=1", src_repo, tmp_dir],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if result.returncode != 0:
+                    stderr = result.stderr.lower()
+                    if any(w in stderr for w in ("authentication", "auth", "403", "401", "permission denied")):
+                        logger.warning("src-repo %s: auth failure: %s", repo_id, result.stderr.strip())
+                        return "auth_failure"
+                    logger.warning("src-repo %s: clone failed: %s", repo_id, result.stderr.strip())
+                    return "other_failure"
+                scan_path = tmp_dir
+            else:
+                scan_path = str(Path(src_repo).resolve())
+
+            import os as _os
+            fd, tmp_sarif_str = tempfile.mkstemp(suffix=".sarif", prefix="agentdiscover_src_")
+            _os.close(fd)
+            tmp_sarif_path = Path(tmp_sarif_str)
+
+            _invoke_layer1_scan(scan_path, str(tmp_sarif_path))
+            _merge_sarif_results(layer1_sarif, tmp_sarif_path)
+            logger.info("src-repo %s: scan merged into %s", repo_id, layer1_sarif)
+            return "success"
+        except Exception as e:
+            logger.warning("src-repo %s: scan failed: %s", repo_id, e)
+            return "other_failure"
+        finally:
+            if tmp_sarif_path and tmp_sarif_path.exists():
+                try:
+                    tmp_sarif_path.unlink()
+                except Exception:
+                    pass
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    _src_repo_state: dict = {
+        "last_scanned_at": 0.0,
+        "backoff_until": 0.0,
+        "backoff_sec": _DAEMON_BACKOFF_INITIAL_SEC,
+    }
+
+    def run_src_repo_if_stale() -> None:
+        if not src_repo or is_skipped(1):
+            return
+        now = time.monotonic()
+        if now < _src_repo_state["backoff_until"]:
+            return
+        if now - _src_repo_state["last_scanned_at"] < src_repo_ttl:
+            return
+        outcome = run_src_repo_once()
+        _src_repo_state["last_scanned_at"] = time.monotonic()
+        if outcome == "auth_failure":
+            _src_repo_state["backoff_sec"] = min(
+                _src_repo_state["backoff_sec"] * 2, _DAEMON_BACKOFF_MAX_SEC
+            )
+            _src_repo_state["backoff_until"] = time.monotonic() + _src_repo_state["backoff_sec"]
+            logger.warning(
+                "src-repo: auth failure; backing off %ss", _src_repo_state["backoff_sec"]
+            )
+        else:
+            _src_repo_state["backoff_sec"] = _DAEMON_BACKOFF_INITIAL_SEC
+            _src_repo_state["backoff_until"] = 0.0
+
     def run_correlation_once() -> dict:
         if daemon:
             # Load from files each cycle to avoid accumulating findings in memory
@@ -584,6 +733,12 @@ def execute_scan_all(
             futures.append(executor.submit(run_layer2_once))
             futures.append(executor.submit(run_layer3_once))
             wait(futures)
+
+        if src_repo and not is_skipped(1):
+            run_src_repo_once()
+            from agent_discover_scanner.correlator import CorrelationEngine as _CE
+            with findings_lock:
+                code_findings = _CE.load_code_findings(layer1_sarif)
 
         from agent_discover_scanner.high_risk_agents import detect_all_high_risk_agents
 
@@ -767,6 +922,7 @@ def execute_scan_all(
                             observer.start()
                             try:
                                 while not stop_event.is_set():
+                                    run_src_repo_if_stale()
                                     time.sleep(1)
                             finally:
                                 observer.stop()
@@ -775,6 +931,7 @@ def execute_scan_all(
                             # Fallback: periodic rescan every 5 minutes
                             while not stop_event.is_set():
                                 run_layer1_once()
+                                run_src_repo_if_stale()
                                 if stop_event.wait(300):
                                     break
                         backoff_sec = _DAEMON_BACKOFF_INITIAL_SEC
@@ -1072,8 +1229,24 @@ def execute_scan_all(
 
     console.print(f"\n[green]✅ Scan complete — results saved to {output_dir}[/green]\n")
 
+    # If everything is zero, surface actionable next steps rather than leaving the user stuck
+    total_found = (
+        report["summary"]["confirmed"]
+        + report["summary"]["unknown"]
+        + report["summary"].get("shadow_ai_usage", 0)
+        + report["summary"].get("zombie", 0)
+        + report["summary"]["ghost"]
+    )
+    if total_found == 0 and not daemon:
+        console.print("[dim]Nothing found. A few reasons this happens:[/dim]")
+        console.print("[dim]  • The scanned directory has no AI framework code (try pointing at a specific project)[/dim]")
+        console.print("[dim]  • No AI apps were running or making API calls during the observation window[/dim]")
+        if sys.platform == "darwin":
+            console.print("[dim]  • On macOS, install Claude Desktop or Cursor to see Shadow AI detection[/dim]")
+        console.print("[dim]  • Try git-scan to find AI dependencies introduced in git history:[/dim]")
+        console.print(f"[dim]    agent-discover git-scan {path}[/dim]\n")
+
     if scan_output_format == "json":
         console.print(json.dumps(report, indent=2))
-
 
     return report

@@ -282,27 +282,33 @@ class NetworkMonitor:
             Summary dict with all detected connections
         """
         print(f"   Observing runtime behavior ({duration_seconds}s)...")
-        
+
         all_connections = []
         unique_connections = set()  # Track (process, service) pairs
         start_time = time.time()
-        
+        last_tick_at = start_time
+        tick_interval = 15  # print a progress line every 15s if nothing detected
+
         while time.time() - start_time < duration_seconds:
             connections = self.get_active_ai_connections()
-            
+            detected_this_round = False
+
             for conn in connections:
-                # Create unique key
                 conn_key = (conn.process_name, conn.ai_service, conn.remote_host)
-                
                 if conn_key not in unique_connections:
                     unique_connections.add(conn_key)
                     all_connections.append(conn)
-                    
-                    # Print detection
+                    detected_this_round = True
                     print(f"[DETECT] {conn.ai_service} connection from {conn.process_name} "
                           f"(PID: {conn.pid}) → {conn.remote_host}:{conn.remote_port}")
-            
-            # Wait before next check
+
+            now = time.time()
+            elapsed = int(now - start_time)
+            remaining = max(0, duration_seconds - elapsed)
+            if not detected_this_round and now - last_tick_at >= tick_interval and remaining > 5:
+                print(f"   [{elapsed}s] Watching for AI connections... ({remaining}s remaining)")
+                last_tick_at = now
+
             time.sleep(interval_seconds)
         
         # Generate summary

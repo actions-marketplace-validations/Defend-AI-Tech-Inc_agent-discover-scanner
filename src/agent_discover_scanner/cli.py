@@ -598,6 +598,16 @@ def scan_all(
         "--dry-run",
         help="Validate configuration and report which layers are available without running a scan",
     ),
+    src_repo: Optional[str] = typer.Option(
+        None,
+        "--src-repo",
+        help="Additional source repository to scan through Layer 1 (local path or remote URL). Findings are merged into layer1_code.sarif.",
+    ),
+    src_repo_ttl: int = typer.Option(
+        3600,
+        "--src-repo-ttl",
+        help="In daemon mode: minimum seconds between re-scans of --src-repo (default: 3600)",
+    ),
 ):
     """
     Run a full 4-layer AI agent scan, correlate all findings,
@@ -633,6 +643,8 @@ def scan_all(
         scan_output_format=format,
         layer=layer,
         dry_run=dry_run,
+        src_repo=src_repo,
+        src_repo_ttl=src_repo_ttl,
     )
 
 
@@ -1007,6 +1019,108 @@ def endpoint(
         output_path.write_text(json.dumps(json_data, indent=2))
     
     console.print(f"\n[green]✓ Report saved to:[/green] [cyan]{output_path}[/cyan]\n")
+
+
+@app.command("git-scan")
+def git_scan(
+    path: str = typer.Argument(..., help="Path to the git repository to scan"),
+    since: int = typer.Option(
+        90,
+        "--since",
+        "-s",
+        help="How many days back to search for secrets in commit history",
+    ),
+    output: Optional[str] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write findings to a JSON file",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Show all findings including info-level dependency timeline",
+    ),
+):
+    """
+    Scan git history for AI-related security signals.
+
+    Detects:
+    - AI API keys committed to history (critical)
+    - .env and credential files ever tracked in git (high)
+    - When AI frameworks were first introduced to the codebase (info)
+    """
+    from agent_discover_scanner.git_scanner import GitFinding, is_git_repo, scan_repo
+
+    try:
+        scan_root = validate_directory_exists(path, "Repository directory")
+    except ValidationError:
+        raise typer.Exit(code=1)
+
+    if not is_git_repo(scan_root):
+        console.print(f"[red]✗ {scan_root} is not a git repository[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"\n[bold green]🔍 Scanning git history in {scan_root}[/bold green]\n")
+    console.print(f"[dim]  Secrets: last {since} days · Sensitive files: full history[/dim]\n")
+
+    findings = scan_repo(scan_root, since_days=since)
+
+    if not findings:
+        console.print("[green]✓ No AI-related security signals found in git history[/green]")
+        raise typer.Exit(code=0)
+
+    critical = [f for f in findings if f.severity == "critical"]
+    high = [f for f in findings if f.severity == "high"]
+    medium = [f for f in findings if f.severity == "medium"]
+    info = [f for f in findings if f.severity == "info"]
+
+    summary_table = Table(show_header=True, header_style="bold magenta")
+    summary_table.add_column("Severity", style="cyan", width=10)
+    summary_table.add_column("Count", style="green", width=7)
+    summary_table.add_column("Type")
+
+    if critical:
+        summary_table.add_row("[red]CRITICAL[/red]", str(len(critical)), "API keys in git history")
+    if high:
+        summary_table.add_row("[yellow]HIGH[/yellow]", str(len(high)), "Sensitive files committed")
+    if medium:
+        summary_table.add_row("[blue]MEDIUM[/blue]", str(len(medium)), "AI config files tracked")
+    if info:
+        summary_table.add_row("[dim]INFO[/dim]", str(len(info)), "AI dependency timeline")
+
+    console.print(summary_table)
+    console.print()
+
+    severity_color = {"critical": "red", "high": "yellow", "medium": "blue", "info": "dim"}
+    show = findings if verbose else [f for f in findings if f.severity in ("critical", "high", "medium")]
+
+    for f in show:
+        color = severity_color.get(f.severity, "white")
+        console.print(f"[{color}]{f.severity.upper()}[/{color}] [{f.rule_id}] {f.message}")
+        if f.file_path:
+            console.print(f"  File:   {f.file_path}")
+        if f.commit_hash:
+            parts = " ".join(filter(None, [f.commit_hash, f.commit_date, f.author]))
+            console.print(f"  Commit: {parts}")
+        if f.detail:
+            console.print(f"  [dim]{f.detail}[/dim]")
+        console.print()
+
+    if not verbose and info:
+        console.print(f"[dim]{len(info)} info finding(s) hidden — use --verbose to show dependency timeline[/dim]\n")
+
+    if output:
+        output_path = Path(output)
+        output_path.write_text(
+            json.dumps([f.model_dump() for f in findings], indent=2),
+            encoding="utf-8",
+        )
+        console.print(f"[green]✓ Findings written to {output_path}[/green]")
+
+    if critical or high:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

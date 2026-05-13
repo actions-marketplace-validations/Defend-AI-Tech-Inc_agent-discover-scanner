@@ -409,6 +409,36 @@ systemctl status defendai-scanner
 
 ---
 
+## Scanning an additional source repository
+
+The `--src-repo` flag adds a second codebase to every Layer 1 scan. Findings are merged into `layer1_code.sarif` alongside the primary scan, so the correlator sees code from both locations in the same run — useful when the runtime you're monitoring is served by a separate repo (microservices, shared ML libraries, a vendor repo you don't own locally).
+
+```bash
+# One-shot: include a remote team's repo in the scan
+agent-discover-scanner scan-all ~/projects \
+  --src-repo https://github.com/acme/ml-services \
+  --duration 30
+
+# Local path — no clone step
+agent-discover-scanner scan-all ~/projects \
+  --src-repo ~/shared/ml-services
+```
+
+In one-shot mode the remote repo is shallow-cloned, scanned, and deleted before the correlator runs.
+
+In daemon mode, pass `--src-repo-ttl` to control how frequently the additional repo is re-fetched:
+
+```bash
+agent-discover-scanner scan-all ~/projects \
+  --daemon \
+  --src-repo https://github.com/acme/ml-services \
+  --src-repo-ttl 7200    # re-clone at most once every 2 hours
+```
+
+Auth failures (HTTP 401/403, SSH key rejection) back off exponentially up to 5 minutes and retry automatically — the primary scan continues uninterrupted.
+
+---
+
 ## Customizing known applications
 
 By default, the scanner classifies common desktop applications (browsers, Office 365, Cursor, Slack, Claude Desktop, etc.) as **Shadow AI** rather than GHOST when they make AI API calls.
@@ -515,6 +545,9 @@ agent-discover-scanner scan-all PATH [OPTIONS]
   --platform-interval INT    Upload every N correlation cycles in daemon mode [default: 5]
   --max-log-size INT         Rotate output files at this size in MB [default: 50]
   --max-log-backups INT      Rotated backup files to keep [default: 5]
+  --src-repo TEXT            Additional source repo to scan through Layer 1 (local path or URL)
+  --src-repo-ttl INT         Daemon: minimum seconds between re-scans of --src-repo [default: 3600]
+  --dry-run                  Check layer availability without running a scan
 
 # Individual layers
 agent-discover-scanner scan PATH              # Layer 1: source code only
